@@ -9,7 +9,7 @@ venv/
 *.pt
 
 # Allow only your trained model
-!best.pt
+#!best.pt
 
 # Videos
 *.mp4
