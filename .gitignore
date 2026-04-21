@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.pyc
+
+# Virtual env
+venv/
+
+# Ignore all models
+*.pt
+
+# Allow only your trained model
+!best.pt
+
+# Videos
+*.mp4
+*.avi
+
+# Output
+output/
