@@ -31,9 +31,15 @@ def iou(boxA, boxB):
 
 
 def scale_box(box, scale):
-    """Scale a box that was detected on a resized frame back to original frame size."""
     x1, y1, x2, y2 = box
     return [int(x1 / scale), int(y1 / scale), int(x2 / scale), int(y2 / scale)]
+
+
+def smooth_box_ema(old_box, new_box, alpha=0.35):
+    return [
+        int(alpha * new_box[i] + (1 - alpha) * old_box[i])
+        for i in range(4)
+    ]
 
 
 # ─────────────────────────── person ───────────────────────────
@@ -41,14 +47,24 @@ def scale_box(box, scale):
 class Person:
     def __init__(self, pid, box):
         self.id = pid
-        self.box = box
+        self.box = list(box)
+        self.smooth_box = list(box)
         self.center = center(box)
+        self.smooth_center = self.center
         self.last_seen = time.time()
+        self.missed_frames = 0
 
     def update(self, box):
-        self.box = box
-        self.center = center(box)
+        self.box = list(box)
+        self.smooth_box = smooth_box_ema(self.smooth_box, box, alpha=0.35)
+        new_center = center(box)
+        self.smooth_center = (
+            int(0.35 * new_center[0] + 0.65 * self.smooth_center[0]),
+            int(0.35 * new_center[1] + 0.65 * self.smooth_center[1]),
+        )
+        self.center = new_center
         self.last_seen = time.time()
+        self.missed_frames = 0
 
 
 # ─────────────────────────── bag ───────────────────────────
@@ -56,17 +72,19 @@ class Person:
 class Bag:
     def __init__(self, bid, box):
         self.id = bid
-        self.box = box
+        self.box = list(box)
+        self.smooth_box = list(box)
         self.center = center(box)
         self.last_seen = time.time()
         self.missed_frames = 0
 
-        # position history for static check
-        self.history = deque(maxlen=30)
+        self.history = deque(maxlen=40)
         self.history.append(self.center)
-
-        # smoothed center to reduce jitter
         self.smooth_center = self.center
+
+        # confirmation — bag must appear in multiple frames before logic starts
+        self.confirmed_frames = 0
+        self.is_confirmed = False
 
         # owner tracking
         self.owner_id = None
@@ -74,30 +92,36 @@ class Bag:
         self.owner_last_seen = None
         self.near_owner_frames = 0
 
-        # timers
+        # placement detection — bag must be stationary BEFORE timers start
+        self.placed_since = None       # when bag first became stationary
+        self.is_placed = False         # True only after bag has been still for placed_sec
+
+        # timers — only start AFTER bag is confirmed as placed
         self.static_since = None
         self.alone_since = None
         self.abandoned_since = None
         self.is_abandoned = False
 
     def update(self, box):
-        self.box = box
+        self.box = list(box)
+        self.smooth_box = smooth_box_ema(self.smooth_box, box, alpha=0.35)
         new_center = center(box)
-
-        # smooth center using EMA to reduce jitter-based false static resets
-        alpha = 0.4
         self.smooth_center = (
-            int(alpha * new_center[0] + (1 - alpha) * self.smooth_center[0]),
-            int(alpha * new_center[1] + (1 - alpha) * self.smooth_center[1]),
+            int(0.35 * new_center[0] + 0.65 * self.smooth_center[0]),
+            int(0.35 * new_center[1] + 0.65 * self.smooth_center[1]),
         )
         self.center = new_center
         self.last_seen = time.time()
         self.missed_frames = 0
         self.history.append(self.smooth_center)
 
-    def is_static(self, threshold=18):
-        """Check if bag has been mostly stationary using smoothed center history."""
-        if len(self.history) < 8:
+        if not self.is_confirmed:
+            self.confirmed_frames += 1
+            if self.confirmed_frames >= 6:
+                self.is_confirmed = True
+
+    def is_static(self, threshold=20):
+        if len(self.history) < 10:
             return False
         avg_x = sum(p[0] for p in self.history) / len(self.history)
         avg_y = sum(p[1] for p in self.history) / len(self.history)
@@ -107,7 +131,7 @@ class Bag:
 # ─────────────────────────── person tracker ───────────────────────────
 
 class PersonTracker:
-    def __init__(self, max_match_dist=90, forget_sec=5.0):
+    def __init__(self, max_match_dist=100, forget_sec=8.0):
         self.max_match_dist = max_match_dist
         self.forget_sec = forget_sec
         self.tracks = {}
@@ -124,9 +148,9 @@ class PersonTracker:
                 if i in used:
                     continue
                 c = center(box)
-                d = dist(old.center, c)
-                ov = iou(old.box, box)
-                if not (ov > 0.3 or d < 60):
+                d = dist(old.smooth_center, c)
+                ov = iou(old.smooth_box, box)
+                if not (ov > 0.25 or d < 80):
                     continue
                 score = ov * 1000 - d
                 if score > best_score:
@@ -137,14 +161,16 @@ class PersonTracker:
                 old.update(person_boxes[best_i])
                 updated[pid] = old
                 used.add(best_i)
-            elif now - old.last_seen <= self.forget_sec:
-                updated[pid] = old
+            else:
+                old.missed_frames += 1
+                if now - old.last_seen <= self.forget_sec:
+                    updated[pid] = old
 
         for i, box in enumerate(person_boxes):
             if i in used:
                 continue
             c = center(box)
-            if not any(dist(t.center, c) < 50 for t in updated.values()):
+            if not any(dist(t.smooth_center, c) < 60 for t in updated.values()):
                 updated[self.next_id] = Person(self.next_id, box)
                 self.next_id += 1
 
@@ -154,7 +180,7 @@ class PersonTracker:
 # ─────────────────────────── bag tracker ───────────────────────────
 
 class BagTracker:
-    def __init__(self, max_match_dist=150, max_missed_frames=15):
+    def __init__(self, max_match_dist=150, max_missed_frames=20):
         self.max_match_dist = max_match_dist
         self.max_missed_frames = max_missed_frames
         self.tracks = {}
@@ -172,7 +198,7 @@ class BagTracker:
                     continue
                 c = center(box)
                 d = dist(old.smooth_center, c)
-                ov = iou(old.box, box)
+                ov = iou(old.smooth_box, box)
                 score = ov * 1000 - d
                 if (ov > 0.2 or d < 80) and score > best_score:
                     best_score = score
@@ -184,19 +210,18 @@ class BagTracker:
                 used.add(best_i)
             else:
                 old.missed_frames += 1
-                # keep abandoned bags alive much longer even if not detected
                 if old.is_abandoned:
-                    if (now - old.last_seen) <= 15.0:
+                    if (now - old.last_seen) <= 20.0:
                         updated[bid] = old
                 else:
-                    if old.missed_frames <= self.max_missed_frames and (now - old.last_seen) <= 5.0:
+                    if old.missed_frames <= self.max_missed_frames and (now - old.last_seen) <= 6.0:
                         updated[bid] = old
 
         for i, box in enumerate(bag_boxes):
             if i in used:
                 continue
             c = center(box)
-            if not any(dist(t.smooth_center, c) < 55 for t in updated.values()):
+            if not any(dist(t.smooth_center, c) < 60 for t in updated.values()):
                 updated[self.next_id] = Bag(self.next_id, box)
                 self.next_id += 1
 
@@ -209,23 +234,23 @@ def main():
     parser = argparse.ArgumentParser("Abandoned bag detection")
     parser.add_argument("--model",            type=str,   default="best.pt")
     parser.add_argument("--source",           type=str,   default="0")
-    parser.add_argument("--conf",             type=float, default=0.40)   # lowered for stationary bags
-    parser.add_argument("--near-person-dist", type=float, default=120.0)
-    parser.add_argument("--bag-static-sec",   type=float, default=3.0)
-    parser.add_argument("--bag-alone-sec",    type=float, default=4.0)
+    parser.add_argument("--conf",             type=float, default=0.30)   # lower for better bag detection
+    parser.add_argument("--iou-thresh",       type=float, default=0.45)   # NMS threshold
+    parser.add_argument("--near-person-dist", type=float, default=100.0)  # 1-2 steps away
+    parser.add_argument("--placed-sec",       type=float, default=3.0)    # bag must be still this long before timers start
+    parser.add_argument("--bag-alone-sec",    type=float, default=5.0)    # warning duration before abandoned
     parser.add_argument("--resize",           type=int,   default=640)
     parser.add_argument("--skip-frames",      type=int,   default=1)
     args = parser.parse_args()
 
     model = YOLO(args.model)
 
-    # open source
-    if args.source.startswith("rtsp://"):
+    is_rtsp = args.source.startswith("rtsp://")
+
+    if is_rtsp:
         cap = cv2.VideoCapture(args.source, cv2.CAP_FFMPEG)
         cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
         cap.set(cv2.CAP_PROP_FPS, 15)
-        cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
     else:
         cap = cv2.VideoCapture(0 if args.source == "0" else args.source)
 
@@ -235,7 +260,6 @@ def main():
 
     print("Classes:", model.names)
 
-    # identify class IDs
     bag_ids, person_ids = set(), set()
     for cid, name in model.names.items():
         n = str(name).lower()
@@ -249,15 +273,21 @@ def main():
         print("Detected classes:", model.names)
         return
 
-    person_tracker = PersonTracker(max_match_dist=90, forget_sec=5.0)
-    bag_tracker    = BagTracker(max_match_dist=130, max_missed_frames=15)
+    person_tracker = PersonTracker(max_match_dist=100, forget_sec=8.0)
+    bag_tracker    = BagTracker(max_match_dist=150, max_missed_frames=20)
 
     fps, fps_cnt = 0.0, 0
     fps_t0 = time.time()
     frame_idx = 0
 
     while True:
-        ret, frame = cap.read()
+        if is_rtsp:
+            for _ in range(2):
+                cap.grab()
+            ret, frame = cap.retrieve()
+        else:
+            ret, frame = cap.read()
+
         if not ret:
             break
 
@@ -270,7 +300,6 @@ def main():
 
         h, w = frame.shape[:2]
 
-        # resize for inference, keep scale for drawing on original frame
         if w > args.resize:
             scale = args.resize / w
             infer_frame = cv2.resize(frame, (args.resize, int(h * scale)))
@@ -278,7 +307,8 @@ def main():
             scale = 1.0
             infer_frame = frame.copy()
 
-        res = model(infer_frame, conf=args.conf, verbose=False)[0]
+        # lower iou threshold helps detect overlapping/close bags better
+        res = model(infer_frame, conf=args.conf, iou=args.iou_thresh, verbose=False)[0]
 
         person_boxes = []
         bag_boxes    = []
@@ -287,15 +317,13 @@ def main():
             for box, conf_val, cls in zip(res.boxes.xyxy, res.boxes.conf, res.boxes.cls):
                 x1, y1, x2, y2 = [int(v) for v in box[:4]]
                 cid = int(cls)
-
-                # scale back to original frame size
                 sx1, sy1, sx2, sy2 = scale_box([x1, y1, x2, y2], scale)
 
                 if cid in person_ids:
                     person_boxes.append([sx1, sy1, sx2, sy2])
                 elif cid in bag_ids:
                     bw, bh = sx2 - sx1, sy2 - sy1
-                    if bw > 25 and bh > 25:
+                    if bw > 20 and bh > 20:   # slightly smaller min size
                         bag_boxes.append([sx1, sy1, sx2, sy2])
 
         person_tracker.update(person_boxes)
@@ -306,72 +334,92 @@ def main():
         # ────────── abandoned logic ──────────
         for bid, b in bag_tracker.tracks.items():
 
-            # find nearest person
+            # skip unconfirmed bags
+            if not b.is_confirmed:
+                continue
+
             nearest_pid, nearest_d = None, float("inf")
             for pid, p in person_tracker.tracks.items():
-                d = dist(b.smooth_center, p.center)
+                d = dist(b.smooth_center, p.smooth_center)
                 if d < nearest_d:
                     nearest_d = d
                     nearest_pid = pid
 
             person_close = nearest_pid is not None and nearest_d <= args.near_person_dist
 
+            # ── placement detection ──
+            # bag must be stationary for placed_sec before ANY abandonment logic starts
+            # this prevents false alerts when person is removing bag from shoulder
+            if b.is_static():
+                if b.placed_since is None:
+                    b.placed_since = now
+                if not b.is_placed and (now - b.placed_since) >= args.placed_sec:
+                    b.is_placed = True
+            else:
+                # bag is moving — reset placement
+                if not b.is_abandoned:
+                    b.placed_since = None
+                    b.is_placed = False
+                    b.static_since = None
+                    b.alone_since = None
+
+            # skip abandonment logic until bag is confirmed as placed
+            if not b.is_placed:
+                continue
+
             # ── owner assignment ──
             if b.owner_id is None:
                 if person_close:
                     b.near_owner_frames += 1
-                    if b.near_owner_frames >= 3:
+                    if b.near_owner_frames >= 4:
                         b.owner_id = nearest_pid
-                        b.owner_last_center = person_tracker.tracks[nearest_pid].center
+                        b.owner_last_center = person_tracker.tracks[nearest_pid].smooth_center
                         b.owner_last_seen = now
                 else:
                     b.near_owner_frames = 0
             else:
-                # update owner position if still visible
                 if b.owner_id in person_tracker.tracks:
-                    b.owner_last_center = person_tracker.tracks[b.owner_id].center
+                    b.owner_last_center = person_tracker.tracks[b.owner_id].smooth_center
                     b.owner_last_seen = now
 
-                # reassign owner only if bag is not abandoned and a much closer person appears
                 if (not b.is_abandoned
                         and person_close
                         and nearest_pid != b.owner_id
                         and nearest_d < args.near_person_dist * 0.5):
                     b.owner_id = nearest_pid
-                    b.owner_last_center = person_tracker.tracks[nearest_pid].center
+                    b.owner_last_center = person_tracker.tracks[nearest_pid].smooth_center
                     b.owner_last_seen = now
 
             # ── static timer ──
-            # FIX: only clear abandoned state if bag physically moves, not on tiny jitter
             if b.is_static():
                 if b.static_since is None:
                     b.static_since = now
             else:
-                # bag is moving — only reset if not abandoned
                 if not b.is_abandoned:
                     b.static_since = None
                     b.alone_since  = None
 
-            # ── alone timer ──
+            # ── alone timer — only starts after owner assigned and walks away ──
             if b.owner_id is not None:
                 owner_visible = b.owner_id in person_tracker.tracks
 
                 if owner_visible:
-                    owner_center = person_tracker.tracks[b.owner_id].center
+                    owner_center = person_tracker.tracks[b.owner_id].smooth_center
                     b.owner_last_center = owner_center
                     b.owner_last_seen = now
                     d_owner = dist(b.smooth_center, owner_center)
 
                     if d_owner > args.near_person_dist:
+                        # person walked away — start alone timer
                         if b.alone_since is None:
                             b.alone_since = now
                     else:
-                        # person is back near bag — reset abandoned state
+                        # person is back near bag
                         b.alone_since     = None
                         b.is_abandoned    = False
                         b.abandoned_since = None
                 else:
-                    # owner disappeared from frame
+                    # owner not visible — start alone timer after grace period
                     if b.owner_last_seen is not None and (now - b.owner_last_seen) > 2.0:
                         if b.alone_since is None:
                             b.alone_since = now
@@ -381,96 +429,86 @@ def main():
                 b.owner_id is not None
                 and b.static_since is not None
                 and b.alone_since is not None
-                and (now - b.static_since) >= args.bag_static_sec
-                and (now - b.alone_since)  >= args.bag_alone_sec
+                and (now - b.alone_since) >= args.bag_alone_sec
             ):
                 if not b.is_abandoned:
                     b.is_abandoned    = True
                     b.abandoned_since = now
 
-                # keep alive even if detector misses it
-                b.last_seen    = now
+                b.last_seen     = now
                 b.missed_frames = 0
 
-            # ── recovery: any person comes close to abandoned bag ──
+            # ── recovery ──
             if b.is_abandoned and person_close:
                 b.is_abandoned    = False
                 b.abandoned_since = None
                 b.alone_since     = None
                 b.static_since    = None
-                # reassign owner to whoever came back
+                b.is_placed       = False
+                b.placed_since    = None
                 b.owner_id         = nearest_pid
-                b.owner_last_center = person_tracker.tracks[nearest_pid].center
+                b.owner_last_center = person_tracker.tracks[nearest_pid].smooth_center
                 b.owner_last_seen   = now
 
-        # ────────── drawing on ORIGINAL frame ──────────
+        # ────────── drawing ──────────
 
-        # draw persons
         for pid, p in person_tracker.tracks.items():
-            x1, y1, x2, y2 = p.box
+            x1, y1, x2, y2 = p.smooth_box
             cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
-            cv2.putText(frame, f"P{pid}",
+            cv2.putText(frame, "Person",
                         (x1, max(15, y1 - 8)),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 0), 2)
 
         alerts = []
 
         for bid, b in bag_tracker.tracks.items():
-            x1, y1, x2, y2 = b.box
+            if not b.is_confirmed:
+                continue
 
-            # determine state and color
+            x1, y1, x2, y2 = b.smooth_box
+
             if b.is_abandoned:
-                color = (0, 0, 255)           # red
+                color = (0, 0, 255)
                 dur   = now - b.abandoned_since if b.abandoned_since else 0
-                label = f"ABANDONED B{bid} ({dur:.1f}s)"
-                alerts.append(label)
+                label = f"ABANDONED ({dur:.1f}s)"
+                alerts.append(f"ALERT: Abandoned Bag! ({dur:.1f}s)")
 
             elif (b.owner_id is not None
-                  and b.static_since is not None
                   and b.alone_since is not None):
-                # warning phase — bag is static and alone but timer not expired yet
-                color = (0, 165, 255)         # orange
-                alone_t  = now - b.alone_since
-                remain   = max(0, args.bag_alone_sec - alone_t)
-                label    = f"WARNING B{bid} ({remain:.1f}s)"
+                # orange warning — person walked away, timer counting
+                color  = (0, 165, 255)
+                remain = max(0, args.bag_alone_sec - (now - b.alone_since))
+                label  = f"WARNING ({remain:.1f}s)"
 
-            elif b.owner_id is not None:
-                color = (255, 180, 0)         # blue — owner assigned, bag active
-                label = f"BAG B{bid}"
+            elif b.is_placed and b.owner_id is not None:
+                color = (255, 180, 0)   # blue — placed, owner assigned
+                label = "BAG"
+
+            elif b.is_placed:
+                color = (200, 200, 200)  # grey — placed, no owner yet
+                label = "BAG"
 
             else:
-                color = (200, 200, 200)       # grey — no owner yet
-                label = f"BAG B{bid}"
+                # bag not yet confirmed as placed — show faint box
+                color = (100, 100, 100)
+                label = ""
 
-            # draw bounding box
             cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
-            cv2.putText(frame, label,
-                        (x1, max(15, y1 - 8)),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+            if label:
+                cv2.putText(frame, label,
+                            (x1, max(15, y1 - 8)),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 2)
             cv2.circle(frame, b.smooth_center, 4, color, -1)
 
-            # draw owner line ONLY during warning phase and active (not abandoned)
-            if not b.is_abandoned and b.owner_id is not None:
-                if b.owner_id in person_tracker.tracks:
-                    owner = person_tracker.tracks[b.owner_id]
-
-                    # line color: orange during warning, white when normal
-                    line_color = (0, 165, 255) if b.alone_since is not None else (255, 255, 255)
-
-                    cv2.line(frame, b.smooth_center, owner.center,
-                             line_color, 2, cv2.LINE_AA)
-
-                    cv2.putText(frame, f"Owner P{b.owner_id}",
-                                (b.smooth_center[0] + 6, b.smooth_center[1] - 6),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.45, line_color, 1)
-
-        # draw alerts top-left
+        # alert banner
         for i, txt in enumerate(alerts):
+            banner_w = len(txt) * 14
+            cv2.rectangle(frame, (0, 35 + i * 38), (banner_w, 65 + i * 38), (0, 0, 180), -1)
             cv2.putText(frame, txt,
-                        (10, 45 + i * 28),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.75, (0, 0, 255), 2)
+                        (10, 58 + i * 38),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
 
-        # FPS counter
+        # FPS
         fps_cnt += 1
         if now - fps_t0 >= 1.0:
             fps     = fps_cnt / (now - fps_t0)
@@ -479,7 +517,7 @@ def main():
 
         cv2.putText(frame, f"FPS: {fps:.1f}",
                     (10, 25),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
 
         cv2.imshow("Abandoned Bag Detection", frame)
         if cv2.waitKey(1) & 0xFF == ord("q"):
