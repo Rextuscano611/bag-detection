@@ -78,13 +78,9 @@ class Bag:
         self.last_seen = time.time()
         self.missed_frames = 0
 
-        self.history = deque(maxlen=40)
+        self.history = deque(maxlen=30)
         self.history.append(self.center)
         self.smooth_center = self.center
-
-        # confirmation — bag must appear in multiple frames before logic starts
-        self.confirmed_frames = 0
-        self.is_confirmed = False
 
         # owner tracking
         self.owner_id = None
@@ -92,15 +88,15 @@ class Bag:
         self.owner_last_seen = None
         self.near_owner_frames = 0
 
-        # placement detection — bag must be stationary BEFORE timers start
-        self.placed_since = None       # when bag first became stationary
-        self.is_placed = False         # True only after bag has been still for placed_sec
-
-        # timers — only start AFTER bag is confirmed as placed
+        # timers
         self.static_since = None
         self.alone_since = None
         self.abandoned_since = None
         self.is_abandoned = False
+
+        # false positive filter — bag must be confirmed over multiple frames
+        self.confirmed_frames = 0
+        self.is_confirmed = False
 
     def update(self, box):
         self.box = list(box)
@@ -115,13 +111,14 @@ class Bag:
         self.missed_frames = 0
         self.history.append(self.smooth_center)
 
+        # confirm bag after seen in enough frames
         if not self.is_confirmed:
             self.confirmed_frames += 1
-            if self.confirmed_frames >= 6:
+            if self.confirmed_frames >= 5:
                 self.is_confirmed = True
 
-    def is_static(self, threshold=20):
-        if len(self.history) < 10:
+    def is_static(self, threshold=18):
+        if len(self.history) < 8:
             return False
         avg_x = sum(p[0] for p in self.history) / len(self.history)
         avg_y = sum(p[1] for p in self.history) / len(self.history)
@@ -234,11 +231,10 @@ def main():
     parser = argparse.ArgumentParser("Abandoned bag detection")
     parser.add_argument("--model",            type=str,   default="best.pt")
     parser.add_argument("--source",           type=str,   default="0")
-    parser.add_argument("--conf",             type=float, default=0.30)   # lower for better bag detection
-    parser.add_argument("--iou-thresh",       type=float, default=0.45)   # NMS threshold
-    parser.add_argument("--near-person-dist", type=float, default=100.0)  # 1-2 steps away
-    parser.add_argument("--placed-sec",       type=float, default=3.0)    # bag must be still this long before timers start
-    parser.add_argument("--bag-alone-sec",    type=float, default=5.0)    # warning duration before abandoned
+    parser.add_argument("--conf",             type=float, default=0.45)   # higher to reduce false bags
+    parser.add_argument("--near-person-dist", type=float, default=80.0)   # tuned value
+    parser.add_argument("--bag-static-sec",   type=float, default=2.0)    # tuned value
+    parser.add_argument("--bag-alone-sec",    type=float, default=3.0)    # tuned value
     parser.add_argument("--resize",           type=int,   default=640)
     parser.add_argument("--skip-frames",      type=int,   default=1)
     args = parser.parse_args()
@@ -307,8 +303,7 @@ def main():
             scale = 1.0
             infer_frame = frame.copy()
 
-        # lower iou threshold helps detect overlapping/close bags better
-        res = model(infer_frame, conf=args.conf, iou=args.iou_thresh, verbose=False)[0]
+        res = model(infer_frame, conf=args.conf, verbose=False)[0]
 
         person_boxes = []
         bag_boxes    = []
@@ -323,7 +318,7 @@ def main():
                     person_boxes.append([sx1, sy1, sx2, sy2])
                 elif cid in bag_ids:
                     bw, bh = sx2 - sx1, sy2 - sy1
-                    if bw > 20 and bh > 20:   # slightly smaller min size
+                    if bw > 25 and bh > 25:
                         bag_boxes.append([sx1, sy1, sx2, sy2])
 
         person_tracker.update(person_boxes)
@@ -334,7 +329,7 @@ def main():
         # ────────── abandoned logic ──────────
         for bid, b in bag_tracker.tracks.items():
 
-            # skip unconfirmed bags
+            # skip unconfirmed bags — reduces false positives
             if not b.is_confirmed:
                 continue
 
@@ -347,27 +342,7 @@ def main():
 
             person_close = nearest_pid is not None and nearest_d <= args.near_person_dist
 
-            # ── placement detection ──
-            # bag must be stationary for placed_sec before ANY abandonment logic starts
-            # this prevents false alerts when person is removing bag from shoulder
-            if b.is_static():
-                if b.placed_since is None:
-                    b.placed_since = now
-                if not b.is_placed and (now - b.placed_since) >= args.placed_sec:
-                    b.is_placed = True
-            else:
-                # bag is moving — reset placement
-                if not b.is_abandoned:
-                    b.placed_since = None
-                    b.is_placed = False
-                    b.static_since = None
-                    b.alone_since = None
-
-            # skip abandonment logic until bag is confirmed as placed
-            if not b.is_placed:
-                continue
-
-            # ── owner assignment ──
+            # owner assignment
             if b.owner_id is None:
                 if person_close:
                     b.near_owner_frames += 1
@@ -390,7 +365,7 @@ def main():
                     b.owner_last_center = person_tracker.tracks[nearest_pid].smooth_center
                     b.owner_last_seen = now
 
-            # ── static timer ──
+            # static timer
             if b.is_static():
                 if b.static_since is None:
                     b.static_since = now
@@ -399,7 +374,7 @@ def main():
                     b.static_since = None
                     b.alone_since  = None
 
-            # ── alone timer — only starts after owner assigned and walks away ──
+            # alone timer
             if b.owner_id is not None:
                 owner_visible = b.owner_id in person_tracker.tracks
 
@@ -410,26 +385,24 @@ def main():
                     d_owner = dist(b.smooth_center, owner_center)
 
                     if d_owner > args.near_person_dist:
-                        # person walked away — start alone timer
                         if b.alone_since is None:
                             b.alone_since = now
                     else:
-                        # person is back near bag
                         b.alone_since     = None
                         b.is_abandoned    = False
                         b.abandoned_since = None
                 else:
-                    # owner not visible — start alone timer after grace period
                     if b.owner_last_seen is not None and (now - b.owner_last_seen) > 2.0:
                         if b.alone_since is None:
                             b.alone_since = now
 
-            # ── abandoned condition ──
+            # abandoned condition
             if (
                 b.owner_id is not None
                 and b.static_since is not None
                 and b.alone_since is not None
-                and (now - b.alone_since) >= args.bag_alone_sec
+                and (now - b.static_since) >= args.bag_static_sec
+                and (now - b.alone_since)  >= args.bag_alone_sec
             ):
                 if not b.is_abandoned:
                     b.is_abandoned    = True
@@ -438,74 +411,70 @@ def main():
                 b.last_seen     = now
                 b.missed_frames = 0
 
-            # ── recovery ──
+            # recovery — person comes back near abandoned bag
             if b.is_abandoned and person_close:
                 b.is_abandoned    = False
                 b.abandoned_since = None
                 b.alone_since     = None
                 b.static_since    = None
-                b.is_placed       = False
-                b.placed_since    = None
                 b.owner_id         = nearest_pid
                 b.owner_last_center = person_tracker.tracks[nearest_pid].smooth_center
                 b.owner_last_seen   = now
 
         # ────────── drawing ──────────
 
+        # draw persons
         for pid, p in person_tracker.tracks.items():
             x1, y1, x2, y2 = p.smooth_box
             cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
-            cv2.putText(frame, "Person",
+            cv2.putText(frame, f"Person",
                         (x1, max(15, y1 - 8)),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 0), 2)
 
         alerts = []
 
         for bid, b in bag_tracker.tracks.items():
+
+            # don't draw unconfirmed bags
             if not b.is_confirmed:
                 continue
 
             x1, y1, x2, y2 = b.smooth_box
 
             if b.is_abandoned:
-                color = (0, 0, 255)
+                color = (0, 0, 255)           # red
                 dur   = now - b.abandoned_since if b.abandoned_since else 0
                 label = f"ABANDONED ({dur:.1f}s)"
-                alerts.append(f"ALERT: Abandoned Bag! ({dur:.1f}s)")
+                alerts.append(f"ALERT: Abandoned bag detected! ({dur:.1f}s)")
 
             elif (b.owner_id is not None
+                  and b.static_since is not None
                   and b.alone_since is not None):
-                # orange warning — person walked away, timer counting
-                color  = (0, 165, 255)
-                remain = max(0, args.bag_alone_sec - (now - b.alone_since))
-                label  = f"WARNING ({remain:.1f}s)"
+                color   = (0, 165, 255)       # orange warning
+                remain  = max(0, args.bag_alone_sec - (now - b.alone_since))
+                label   = f"WARNING ({remain:.1f}s)"
 
-            elif b.is_placed and b.owner_id is not None:
-                color = (255, 180, 0)   # blue — placed, owner assigned
-                label = "BAG"
-
-            elif b.is_placed:
-                color = (200, 200, 200)  # grey — placed, no owner yet
+            elif b.owner_id is not None:
+                color = (255, 180, 0)         # blue — owner assigned
                 label = "BAG"
 
             else:
-                # bag not yet confirmed as placed — show faint box
-                color = (100, 100, 100)
-                label = ""
+                color = (200, 200, 200)       # grey — no owner yet
+                label = "BAG"
 
+            # bounding box and label
             cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
-            if label:
-                cv2.putText(frame, label,
-                            (x1, max(15, y1 - 8)),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 2)
+            cv2.putText(frame, label,
+                        (x1, max(15, y1 - 8)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 2)
             cv2.circle(frame, b.smooth_center, 4, color, -1)
 
-        # alert banner
+        # alert banner at top
         for i, txt in enumerate(alerts):
-            banner_w = len(txt) * 14
-            cv2.rectangle(frame, (0, 35 + i * 38), (banner_w, 65 + i * 38), (0, 0, 180), -1)
+            # draw filled red background for alert
+            cv2.rectangle(frame, (0, 35 + i * 35), (len(txt) * 13, 62 + i * 35), (0, 0, 180), -1)
             cv2.putText(frame, txt,
-                        (10, 58 + i * 38),
+                        (10, 55 + i * 35),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
 
         # FPS
