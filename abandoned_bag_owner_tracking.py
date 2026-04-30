@@ -469,7 +469,7 @@ def main():
                         cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 2)
             cv2.circle(frame, b.smooth_center, 4, color, -1)
 
-        
+        #banner removed 
         
 
         # FPS
