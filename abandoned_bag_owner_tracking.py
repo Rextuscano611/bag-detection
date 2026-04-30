@@ -431,7 +431,7 @@ def main():
                         (x1, max(15, y1 - 8)),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 0), 2)
 
-        alerts = []
+        #alerts = []
 
         for bid, b in bag_tracker.tracks.items():
 
@@ -443,9 +443,9 @@ def main():
 
             if b.is_abandoned:
                 color = (0, 0, 255)           # red
-                dur   = now - b.abandoned_since if b.abandoned_since else 0
-                label = f"ABANDONED ({dur:.1f}s)"
-                alerts.append(f"ALERT: Abandoned bag detected! ({dur:.1f}s)")
+                #dur   = now - b.abandoned_since if b.abandoned_since else 0
+                label = "ABANDONED"
+                #alerts.append(f"ALERT: Abandoned bag detected! ({dur:.1f}s)")
 
             elif (b.owner_id is not None
                   and b.static_since is not None
@@ -469,13 +469,8 @@ def main():
                         cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 2)
             cv2.circle(frame, b.smooth_center, 4, color, -1)
 
-        # alert banner at top
-        for i, txt in enumerate(alerts):
-            # draw filled red background for alert
-            cv2.rectangle(frame, (0, 35 + i * 35), (len(txt) * 13, 62 + i * 35), (0, 0, 180), -1)
-            cv2.putText(frame, txt,
-                        (10, 55 + i * 35),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+        
+        
 
         # FPS
         fps_cnt += 1
